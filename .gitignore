@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# Secrets — never commit
+*.env
+.env*
+*api_key*
+*api-key*
+*.pem
+*.key
+
+# Runtime / pipeline artifacts
+*.mp3
+*.pcm
+*.log
+paper2podcast_runs/

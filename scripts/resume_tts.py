@@ -16,7 +16,7 @@ API_KEY_FILE = "/root/.hermes/secrets/gemini_api_key.txt"
 
 VOICE_A = "Kore"
 VOICE_B = "Charon"
-TTS_MODEL = "gemini-3.1-flash-tts-preview"
+TTS_MODEL = "gemini-2.5-pro-preview-tts"
 LANG = "zh"
 MAX_SEGMENT_BYTES = 2800
 TTS_RENDER_MODE = "per-turn"  # "per-turn" is production-safe; "multi-speaker" is kept for experiments.

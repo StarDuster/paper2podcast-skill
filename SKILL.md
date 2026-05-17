@@ -22,12 +22,49 @@ description: "Convert papers, articles, PDFs, local text, or URLs into a Chinese
 
 ### 角色
 
-- **Alice / speaker_id=0 / voice-a=Kore**：主持人、资深研究者，负责引导讨论和总结直觉。声音坚定、冷静、克制。
+- **Alice / speaker_id=0 / voice-a=Kore**：主持人、资深研究者，负责引导讨论和总结直觉。声音坚定、冷静、克制。**Starduster 偏好 pro TTS，生成时默认使用 `--tts-model gemini-2.5-pro-preview-tts`。**
 - **Bob / speaker_id=1 / voice-b=Charon**：技术专家、审稿人视角，负责追问细节和边界条件。声音信息密集、稳重，不要再用 Puck 作为默认值。
 
 Puck 在 Google 文档中是 `Upbeat / 欢快`，不适合当前 deadpan + staccato 的技术播客风格。除非用户明确要求更轻快，否则 Bob 默认保持 `Charon`。
 
-### TTS 口播要求
+- **GitHub PDF 链接**：直接从 GitHub `blob` 页面提取会失败。必须使用 Raw 链接，通常是在 URL 末尾添加 `?raw=true`。
+- **Flash 逻辑瓶颈与时长缩水**：在 2026-05-14 的任务中，使用 `gemini-3-flash-preview` 作为脚本模型时，在大纲生成阶段出现了 `AttributeError: 'list' object has no attribute 'get'`（模型返回了非预期 JSON 格式）。这触发了自动降级到“单阶段生成”模式。单阶段模式受限于模型单次输出 token 限制，通常只能维持 5-6 分钟的时长。**Starduster 明确表示即使在 503 高峰期，也应优先尝试 Pro 模型以保证时长和逻辑质量，而不是为了躲避 503 而主动选择导致严重降级的 Flash 模型。**
+- **Pro 模型降级**：即使使用 `gemini-3.1-pro-preview`，在生成极其密集或长篇幅的 Segment 时仍可能触发 `finishReason=MAX_TOKENS`。此时系统会降级到 single-stage 模式。如果最终 `ffprobe` 时长仍符合预期（如 10 分钟），则该降级是可接受的，无需重跑。
+- **背景搜索失效**：对于尚未被广泛讨论的新论文（如 2026 年发表），`context-search` 可能会失败。在这种情况下，脚本生成更依赖模型对 PDF 本身的理解。
+
+## ⚠️ 关键坑点 (Critical Pitfalls)
+
+- **JSON 格式不一致**：Flash 模型在处理多阶段 `outline -> segment` 流程时，返回的 JSON 可能与 `AIAgent` 期望的结构不符，导致解析崩溃并降级。
+- **降级后的时长预期**：如果日志显示 `-> single-stage script generation`，产出的播客时长将远低于 10 分钟。如果用户对时长有硬要求，应在修复 Bug 后用 Pro 模型重跑。
+- **Google Gemini API 503 / 高负载降级**：`gemini-3.1-pro-preview` 在高峰期（尤其日本夜间/US 白天交界）可能持续返回 HTTP 503（model experiencing high demand）。这是模型级别不可用，不是 rate limit，`--skip-search` 无效。如果用户未明确许可降级到 Flash，应优先重试 Pro。
+
+### Subagent 超时
+对于目标时长 10 分钟以上的播客，TTS 渲染非常耗时。使用 `delegate_task` 时可能会因为 10 分钟的默认限制而超时。**对于时长 > 5 分钟或多任务并行的请求，强烈建议直接使用 `terminal(background=true)`。**
+
+### 源文章确认
+生成播客前先确认用户给的 URL 就是他们想做成播客的内容。如果用户表述模糊（如"nccl gin 那期"），追问明确链接再执行。避免做错文章重来浪费时间和 API 成本。
+
+### 处理“重做 (Redo)”请求
+
+当用户要求“重做”某篇论文或文章的播客时，应遵循以下流程：
+
+1. **历史溯源**：使用 `session_search` 搜索该文章的 URL 或 arXiv ID。
+2. **分析失败/优化点**：检查之前的运行记录。是时长不够？TTS 质量差？还是生成中途崩了？
+3. **确认版本更新**：对于 arXiv 论文，检查是否有新的版本（如 v1 -> v3）。
+4. **参数优化**：
+   - 如果之前因为时长短，确保本次使用 Pro 模型且 `--duration` 足够。
+   - 如果之前 TTS 质量不佳，确保使用 `gemini-2.5-pro-preview-tts`。
+   - 如果之前超时，检查 `--max-segment-bytes` 设置。
+5. **执行策略**：对于这种已知复杂的“重做”任务，优先使用 `terminal(background=true)` 运行，并在回复中告知用户你基于历史记录做了哪些针对性改进。
+
+### 监控后台任务
+- **脚本生成降级 (MAX_TOKENS / Schema Error)**：如果某段脚本生成触发了 `MAX_TOKENS` 限制，或者模型输出的 JSON 格式不符合预期（例如 Flash 模型返回 list 而非 dict 导致 Python `AttributeError`），系统会自动降级到单阶段脚本生成。这种降级是“保命”机制，但会导致最终时长由于模型单次输出长度限制而大幅缩水（通常只能撑 5-6 分钟）。**为了保证 10 分钟以上的足额时长，优先使用 Pro 模型进行脚本生成。**
+- **并行任务处理**：当用户同时请求多个播客时，应为每个 URL 启动独立的后台进程，不要在同一个 `delegate_task` 中串行执行。
+- **文件名规范**：如果输入包含 arXiv ID（如 `2411.01783`），优先使用该 ID 作为输出文件名（例如 `arxiv_2411_01783.mp3`），而不是默认的 `url_podcast.mp3`。这有助于用户通过文件名快速识别内容。
+- **动态输出路径**：`scripts/paper2podcast.py` 会将结果放在 `/tmp/paper2podcast_runs/<timestamp>/` 下。**不要猜测**输出路径为 `/tmp/arxiv_*.mp3`。必须从脚本输出或 `paper2podcast.log` 中获取 `output_path` 的真实值。
+- **发送 Caption**：`tg_send_audio.py` 的 caption 参数如果以 `@` 开头，会读取文件内容。确保路径正确（通常在 work_dir 下）。
+
+## TTS 口播要求
 
 per-turn TTS prompt 只服务单个 turn。不要在正文里插入 `[冷静]`、`[疑问]` 这类 inline style tag，避免干扰 voice 绑定。语气通过全局 delivery 指令控制。
 
@@ -79,7 +116,7 @@ python3 scripts/paper2podcast.py <input> [options]
 | `--voice-a` | `Kore` | Alice / speaker_id=0 |
 | `--voice-b` | `Charon` | Bob / speaker_id=1 |
 | `--script-model` | `gemini-3.1-pro-preview` | 脚本生成模型 |
-| `--tts-model` | `gemini-3.1-flash-tts-preview` | TTS 模型 |
+| `--tts-model` | `gemini-2.5-pro-preview-tts` | TTS 模型（pro 音质，Starduster 确认偏好） |
 | `--output` | 自动 | 输出 MP3 路径 |
 | `--script-only` | 关闭 | 只生成脚本 JSON，不合成音频 |
 | `--script` | 无 | 使用已有脚本 JSON，跳过脚本生成 |
@@ -115,6 +152,8 @@ python3 scripts/paper2podcast.py /tmp/article.md --max-segment-bytes 2400 --outp
 
 - `speaker_id=0` → `voice-a` → 默认 `Kore`
 - `speaker_id=1` → `voice-b` → 默认 `Charon`
+
+⚠️ **TTS 质量反馈**：2026-05-03 NCCL Gin 播客使用了 gemini-3.1-flash-tts-preview，用户反馈不满意。重做时应先确认用户偏好或使用默认 pro TTS（gemini-2.5-pro-preview-tts）。
 
 `--max-segment-bytes` 只影响 `multi-speaker` 实验模式。生产路径不要再依赖 Gemini 在同一个请求里区分 Alice/Bob。
 
@@ -164,7 +203,7 @@ SEGMENTS_DIR = "/tmp/existing_segments_dir"
 OUTPUT_MP3 = "/tmp/final_output.mp3"
 VOICE_A = "Kore"
 VOICE_B = "Charon"
-TTS_MODEL = "gemini-3.1-flash-tts-preview"
+TTS_MODEL = "gemini-2.5-pro-preview-tts"
 LANG = "zh"
 MAX_SEGMENT_BYTES = 2800
 TTS_RENDER_MODE = "per-turn"
@@ -283,35 +322,40 @@ Gemini 有时返回：
 
 ## 发送音频
 
+## 发送音频
+
+**发送策略：播客生成后，只发送到固定的播客 topic（用 `<CHAT_ID>` / `<THREAD_ID>` 占位，按你自己的群组替换），不再额外发一份到私聊，避免消息重复占空间。**
+
 优先用同目录脚本发送 Telegram 音频，caption 和音频在同一条消息里：
-
 ```bash
-python3 scripts/tg_send_audio.py <chat_id> /tmp/output.mp3 "@/tmp/caption.txt"
+python3 scripts/tg_send_audio.py <CHAT_ID> <mp3_path> "@/tmp/caption.txt" --thread-id <THREAD_ID>
 ```
 
-常用私聊目标：
-
+**Caption 格式规范：**
 ```text
-104582944
+🎙️ 播客：[标题]
+🔗 [URL]
+👤 [来源]
+🗣️ zh · 双人研讨式 · [时长] min · [大小] MB
+
+[内容简介]
 ```
 
-如果要发群 topic，再显式传：
+**⚠️ 严格禁令：** Caption 必须严格遵守上述模版，禁止在下方或其中添加任何个人评论、推销语或“本期为满血版”之类的额外注释。Starduster 极其反感冗余的文案干扰。
 
-```bash
-python3 scripts/tg_send_audio.py -1003729380208 /tmp/output.mp3 "@/tmp/caption.txt" --thread-id 36
-```
+**发送大文件坑点：** 播客音频通常 5–15 MB，走 Bot API `sendAudio` 上传较慢，`tg_send_audio.py` 在前台容易超时。建议用 `background: true` 或 `systemd-run` 放到后台跑，给足 300 秒超时。
 
-caption 建议包含：
+**包装脚本坑点：** 如果 `paper2podcast.py` 已经输出 `status=success` 和 `📁 Output: ...`，但外层 bash 脚本随后因为 caption/postprocess 报错退出 1，不要重跑整条播客生成流程。先用 `ffprobe` 验证 MP3，再只修 caption/发送步骤。写 caption 时不要在 Python heredoc 里直接引用未注入的 shell 变量（如 `{TITLE}`）；应通过环境变量 `TITLE=$TITLE python3 ...` 传入，否则会触发 `NameError`。
 
-- 文章标题
-- 来源 URL 或本地来源说明
-- 语言、时长、文件大小
-- 本次版本要验证的点，例如 voice、分段大小、是否修复旧分片混入
+**手动恢复技巧：** 若 TTS 在最后 1-2 段因 `finishReason=OTHER` 失败导致主程序不合成最终 MP3，可手动进入 `segments/` 目录，使用 `ls -v *.mp3 | sed "s/^/file '/;s/$/'/" > list.txt && ffmpeg -f concat -safe 0 -i list.txt -c copy output.mp3` 进行物理拼接，挽救已生成的 99% 的进度。
 
-## 工作纪律
+**Telegram approval 坑点：** 从 agent terminal 发送带 emoji caption 时，Unicode variation selectors 可能触发安全审批；用户审批或新消息可能中断当前 sendAudio。遇到这种情况不要重做音频，改用纯文本 caption 或后台重试发送即可。
 
-- URL 是 positional argument，不是 `--url`。
-- 同一输出路径不要并发跑多个进程。
-- 用户要求“重跑刚才的文章”时，优先复用已确认的源文本和脚本路径，但 TTS 分片必须重新隔离生成。
-- 不要用旧 `/tmp/deepseek_attention_segments/` 这类固定目录手工拼接，除非明确验证 metadata。
-- 代码改完必须跑 `py_compile`，TTS 相关改动还要做一次真实或离线回归。
+## 相关资源 (Resources)
+
+- `references/session-2026-05-16-github-raw-pdf.md`: 关于 GitHub Raw PDF 链接处理与 Pro 模型 MAX_TOKENS 降级的记录。
+- `references/gemini-503-2026-05-12.md`: Gemini API 503 高峰期 outage 记录与降级路径。
+- `references/session-2026-05-08-delegate-timeout.md`: 记录了使用 delegate_task 导致超时的具体案例与恢复方法。
+- `references/session-2026-05-06-timeouts-paths.md`: 关于 Subagent 超时与动态路径的教训。
+- `references/session-2026-05-02-bugfixes.md`: 脚本解析与 TTS 错误处理。
+- `references/tts-feedback-nccl-gin-2026-05-03.md`: TTS 质量反馈案例（用户不满意 flash TTS）。

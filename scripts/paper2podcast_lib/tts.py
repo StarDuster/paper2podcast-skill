@@ -298,7 +298,7 @@ def _build_tts_body(
             },
         }
     return {
-        "contents": [{"parts": [{"text": text}]}],
+        "contents": [{"role": "user", "parts": [{"text": text}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": speech_config,
@@ -312,7 +312,7 @@ def _build_tts_body(
 
 async def tts_render_async(
     session,
-    api_key,
+    api_runtime,
     segment,
     segment_idx,
     total_segments,
@@ -378,7 +378,7 @@ async def tts_render_async(
     for attempt in range(max_retries):
         try:
             resp_data = await call_gemini_async(
-                session, api_key, tts_model, body,
+                session, api_runtime, tts_model, body,
                 timeout=300,
                 request_label=f"TTS {output_label}/{total_segments}",
             )
@@ -435,7 +435,7 @@ def _infer_segment_position(idx: int, total: int) -> str:
 
 
 async def run_tts_async(
-    api_key,
+    api_runtime,
     segments,
     output_dir,
     lang,
@@ -462,7 +462,7 @@ async def run_tts_async(
 
     async def render(session, idx):
         return await tts_render_async(
-            session, api_key, segments[idx], idx, total, output_dir,
+            session, api_runtime, segments[idx], idx, total, output_dir,
             lang, voice_a, voice_b, tts_model,
             mode=render_mode,
             segment_position=_infer_segment_position(idx, total),
@@ -494,24 +494,24 @@ async def run_tts_async(
 # ---------------------------------------------------------------------------
 
 async def tts_segment_async(
-    session, api_key, entries, segment_idx, total_segments, output_dir,
+    session, api_runtime, entries, segment_idx, total_segments, output_dir,
     lang, voice_a, voice_b, tts_model, segment_position: str = "middle",
 ):
     """Compat wrapper around tts_render_async(mode='multi-speaker')."""
     return await tts_render_async(
-        session, api_key, entries, segment_idx, total_segments, output_dir,
+        session, api_runtime, entries, segment_idx, total_segments, output_dir,
         lang, voice_a, voice_b, tts_model,
         mode="multi-speaker", segment_position=segment_position,
     )
 
 
 async def tts_turn_async(
-    session, api_key, entry, segment_idx, total_segments, output_dir,
+    session, api_runtime, entry, segment_idx, total_segments, output_dir,
     lang, voice_a, voice_b, tts_model, segment_position: str = "middle",
 ):
     """Compat wrapper around tts_render_async(mode='per-turn')."""
     return await tts_render_async(
-        session, api_key, [entry], segment_idx, total_segments, output_dir,
+        session, api_runtime, [entry], segment_idx, total_segments, output_dir,
         lang, voice_a, voice_b, tts_model,
         mode="per-turn", segment_position=segment_position,
     )

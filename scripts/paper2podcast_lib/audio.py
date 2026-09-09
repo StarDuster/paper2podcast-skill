@@ -21,8 +21,30 @@ def _replace_or_copy(source: Path, target: Path) -> None:
         source.unlink(missing_ok=True)
 
 
-def concat_segments(segment_files, output_file, temp_dir: str | Path | None = None):
-    """Concatenate MP3 segments into the final output file."""
+def _make_silence_mp3(path: Path, duration_ms: int) -> None:
+    """Create a short mono MP3 silence clip for safe turn spacing."""
+    duration_s = max(0.001, duration_ms / 1000)
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", "anullsrc=r=24000:cl=mono",
+            "-t", f"{duration_s:.3f}",
+            "-c:a", "libmp3lame",
+            "-b:a", "128k",
+            str(path),
+        ],
+        capture_output=True,
+        timeout=30,
+        text=True,
+    )
+    if result.returncode != 0:
+        abort("file-write", f"ffmpeg silence generation failed: {result.stderr[:500]}")
+    ensure_file(str(path), "file-write", "inter-turn silence MP3")
+
+
+def concat_segments(segment_files, output_file, temp_dir: str | Path | None = None, gap_ms: int = 0):
+    """Concatenate MP3 segments into the final output file, optionally inserting fixed gaps."""
     valid: list[Path] = []
     invalid: list[str] = []
     for idx, segment_file in enumerate(segment_files):
@@ -63,12 +85,21 @@ def concat_segments(segment_files, output_file, temp_dir: str | Path | None = No
     else:
         segment_dir = next(iter(segment_dirs))
         filelist_path = segment_dir / f"concat_{os.getpid()}_{int(time.time() * 1000)}.txt"
+        silence_path: Path | None = None
         concat_result = None
         try:
+            if gap_ms > 0:
+                silence_path = segment_dir / f"silence_{gap_ms}ms_{os.getpid()}_{int(time.time() * 1000)}.mp3"
+                _make_silence_mp3(silence_path, gap_ms)
+                log_info(f"🔇 Inserting {gap_ms}ms silence between podcast turns")
+
             with filelist_path.open("w", encoding="utf-8") as f:
-                for segment_path in valid:
+                for idx, segment_path in enumerate(valid):
                     escaped_path = str(segment_path).replace("\\", "\\\\").replace("'", "\\'")
                     f.write(f"file '{escaped_path}'\n")
+                    if silence_path is not None and idx < len(valid) - 1:
+                        escaped_silence = str(silence_path).replace("\\", "\\\\").replace("'", "\\'")
+                        f.write(f"file '{escaped_silence}'\n")
 
             for attempt in range(1, 3):
                 concat_result = subprocess.run(
@@ -85,6 +116,8 @@ def concat_segments(segment_files, output_file, temp_dir: str | Path | None = No
                     time.sleep(attempt * 2)
         finally:
             filelist_path.unlink(missing_ok=True)
+            if silence_path is not None:
+                silence_path.unlink(missing_ok=True)
 
         if concat_result is None or concat_result.returncode != 0:
             target_tmp.unlink(missing_ok=True)

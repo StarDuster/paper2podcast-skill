@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .audio import concat_segments
-from .config import get_api_key, normalize_gemini_model
+from .config import get_api_runtime, normalize_gemini_model
 from .input_parse import load_input
 from .prompts import _build_tts_header, speaker_name_for
 from .runtime import (
@@ -49,8 +51,30 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--output", help="Output MP3 path")
     p.add_argument("--script-only", action="store_true", help="Only generate script")
     p.add_argument("--script", help="Use existing script JSON file")
+    p.add_argument(
+        "--review-provider",
+        default="deepseek",
+        help="Non-Gemini provider used to review and revise generated scripts (default: deepseek)",
+    )
+    p.add_argument(
+        "--review-model",
+        default="deepseek-v4-pro",
+        help="Non-Gemini model used to review and revise generated scripts (default: deepseek-v4-pro)",
+    )
+    p.add_argument(
+        "--no-script-review",
+        action="store_false",
+        dest="script_review",
+        help="Skip external review/revision of generated scripts",
+    )
     p.add_argument("--max-segment-bytes", type=int, default=2800, help="Max bytes per TTS segment (default: 2800)")
     p.add_argument("--workers", type=int, default=2, help="Parallel TTS workers")
+    p.add_argument(
+        "--turn-gap-ms",
+        type=int,
+        default=350,
+        help="Silence inserted between per-turn TTS clips before final concat (default: 350ms)",
+    )
     p.add_argument(
         "--tts-render-mode",
         choices=["per-turn", "multi-speaker"],
@@ -64,35 +88,76 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--skip-search", action="store_true", help="Skip background context search")
     p.add_argument("--no-multistage", action="store_false", dest="multistage", help="Disable multi-stage pipeline (Outline -> Write -> Review)")
-    p.set_defaults(multistage=True)
-    p.add_argument("--api-key", help="Gemini API key")
-    p.add_argument("--api-key-file", help="File containing Gemini API key")
+    p.set_defaults(multistage=True, script_review=True)
+    p.add_argument(
+        "--provider",
+        choices=["gemini", "vertex"],
+        default="gemini",
+        help="Generation/TTS provider: gemini uses the Google Generative Language API; vertex is an explicit Vertex AI path (default: gemini)",
+    )
+    p.add_argument("--api-key", help="Gemini API key (only used with --provider gemini)")
+    p.add_argument("--api-key-file", help="File containing Gemini API key (only used with --provider gemini)")
+    p.add_argument(
+        "--vertex-credentials-file",
+        default="",
+        help="Override Vertex service-account JSON file (default: Hermes vertex.credentials rotation)",
+    )
     p.add_argument("--log-file", default="", help="Write detailed debug logs (default: <work-dir>/paper2podcast.log)")
     return p
+
+
+def _extract_input_slug(input_path: str) -> str:
+    """Extract a meaningful filename slug from the input path or URL."""
+    if input_path == "-":
+        return "stdin"
+
+    # ArXiv detection
+    # https://arxiv.org/pdf/2405.12305.pdf -> 2405.12305
+    # https://arxiv.org/abs/2405.12305 -> 2405.12305
+    arxiv_match = re.search(r"arxiv\.org/(?:pdf|abs)/(\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?", input_path)
+    if arxiv_match:
+        return f"arxiv_{arxiv_match.group(1)}"
+
+    if input_path.startswith(("http://", "https://")):
+        # General URL: take the last part of the path, or hostname
+        try:
+            parsed = urlparse(input_path)
+            path_parts = [p for p in parsed.path.split("/") if p]
+            if path_parts:
+                slug = path_parts[-1].split(".")[0]
+                if slug:
+                    return slug
+            return parsed.netloc.replace(".", "_")
+        except Exception:
+            return "url_podcast"
+
+    # Local file
+    return Path(input_path).stem
 
 
 def _resolve_output_path(args, work_dir: Path) -> str:
     if args.output:
         return args.output
-    if args.input == "-":
-        base_name = "stdin_podcast"
-    elif args.input.startswith("http"):
-        base_name = "url_podcast"
-    else:
-        base_name = Path(args.input).stem + "_podcast"
+    base_name = _extract_input_slug(args.input)
     return str(work_dir / f"{base_name}.mp3")
 
 
 def _validate_cli_args(args) -> None:
     if args.duration <= 0:
         abort("config", f"--duration must be > 0, got {args.duration}")
+    if args.script_review and not str(args.review_provider or "").strip():
+        abort("config", "--review-provider must be non-empty when script review is enabled")
+    if args.script_review and not str(args.review_model or "").strip():
+        abort("config", "--review-model must be non-empty when script review is enabled")
     if args.max_segment_bytes <= 0:
         abort("config", f"--max-segment-bytes must be > 0, got {args.max_segment_bytes}")
     if args.workers <= 0:
         abort("config", f"--workers must be > 0, got {args.workers}")
+    if args.turn_gap_ms < 0:
+        abort("config", f"--turn-gap-ms must be >= 0, got {args.turn_gap_ms}")
 
 
-def _load_or_generate_script(args, api_key, script_path: str):
+def _load_or_generate_script(args, api_runtime, script_path: str):
     """Either load an existing script JSON, or run the generation pipeline."""
     if args.script:
         log_info(f"📄 Loading existing script: {args.script}")
@@ -113,7 +178,18 @@ def _load_or_generate_script(args, api_key, script_path: str):
     paper_text = ensure_non_empty_text("input-parse", paper_text, "parsed input text")
     log_info(f"📄 Input: {len(paper_text)} chars")
     generator = generate_script_multistage if args.multistage else generate_script
-    script = generator(api_key, paper_text, args.lang, args.duration, args.script_model, args.skip_search, args.tts_model)
+    script = generator(
+        api_runtime,
+        paper_text,
+        args.lang,
+        args.duration,
+        args.script_model,
+        args.skip_search,
+        args.tts_model,
+        review_provider=args.review_provider,
+        review_model=args.review_model,
+        review_enabled=args.script_review,
+    )
 
     begin_stage("file-write", "writing generated script JSON")
     script_path = write_json_file(script_path, script, "file-write", "script JSON")
@@ -154,12 +230,12 @@ def _build_segments(args, entries) -> list[list[dict]]:
     return segments
 
 
-def _render_segments(args, api_key, segments, output_dir: str) -> list[str | None]:
+def _render_segments(args, api_runtime, segments, output_dir: str) -> list[str | None]:
     """Run parallel TTS, then retry failed indexes serially."""
     log_info(f"⚙️ Running async TTS with {max(1, args.workers)} workers...")
     segment_files = asyncio.run(
         run_tts_async(
-            api_key, segments, output_dir,
+            api_runtime, segments, output_dir,
             args.lang, args.voice_a, args.voice_b, args.tts_model,
             workers=args.workers,
             render_mode=args.tts_render_mode,
@@ -175,7 +251,7 @@ def _render_segments(args, api_key, segments, output_dir: str) -> list[str | Non
         )
         retried = asyncio.run(
             run_tts_async(
-                api_key, segments, output_dir,
+                api_runtime, segments, output_dir,
                 args.lang, args.voice_a, args.voice_b, args.tts_model,
                 indexes=failed,
                 render_mode=args.tts_render_mode,
@@ -212,7 +288,7 @@ def main() -> int:
         args.tts_model = normalize_gemini_model(args.tts_model)
 
         needs_api = not (args.script and args.script_only)
-        api_key = get_api_key(args) if needs_api else None
+        api_runtime = get_api_runtime(args) if needs_api else None
 
         output_path = _resolve_output_path(args, work_dir)
         script_path = output_path.rsplit(".", 1)[0] + "_script.json"
@@ -220,7 +296,7 @@ def main() -> int:
         get_run_context().script_path = script_path
 
         begin_stage("input-parse", f"source={args.input}")
-        script = _load_or_generate_script(args, api_key, script_path)
+        script = _load_or_generate_script(args, api_runtime, script_path)
 
         if args.script_only:
             log_info("📝 Script-only mode, done.")
@@ -236,10 +312,11 @@ def main() -> int:
         tmpdir.mkdir(parents=True, exist_ok=True)
         log_info(f"🧹 Segment workspace: {tmpdir}")
         try:
-            segment_files = _render_segments(args, api_key, segments, str(tmpdir))
+            segment_files = _render_segments(args, api_runtime, segments, str(tmpdir))
             begin_stage("file-write", "writing final podcast MP3")
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            concat_segments(segment_files, output_path, temp_dir=work_dir)
+            gap_ms = args.turn_gap_ms if args.tts_render_mode == "per-turn" else 0
+            concat_segments(segment_files, output_path, temp_dir=work_dir, gap_ms=gap_ms)
             ensure_file(output_path, "file-write", "final podcast MP3")
         finally:
             begin_stage("cleanup", f"keeping run workspace {work_dir}")

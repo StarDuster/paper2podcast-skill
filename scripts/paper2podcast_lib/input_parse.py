@@ -116,6 +116,10 @@ def _extract_main_text_from_html(html: str) -> str:
 
 def extract_text_from_url(url):
     """Fetch text from URL, extracting clean main body content from HTML."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.hostname in {"arxiv.org", "www.arxiv.org", "export.arxiv.org"} and parsed.path.startswith(("/abs/", "/html/")):
+        url = "https://arxiv.org/pdf/" + parsed.path.split("/", 2)[2]
     headers = {"User-Agent": "Mozilla/5.0 paper2podcast/1.0"}
     last_err = None
 
@@ -127,7 +131,7 @@ def extract_text_from_url(url):
                 content_type = resp.headers.get("Content-Type", "")
                 data = resp.read()
 
-            if "pdf" in content_type.lower() or url.lower().endswith(".pdf"):
+            if data.startswith(b"%PDF-") or "pdf" in content_type.lower() or url.lower().endswith(".pdf"):
                 log_info("📄 URL returned PDF-like content, extracting text")
                 temp_dir = current_work_dir()
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, dir=temp_dir) as f:
@@ -140,12 +144,10 @@ def extract_text_from_url(url):
 
             raw = data.decode("utf-8", errors="replace")
 
-            if "<html" in raw[:2000].lower() or "<!doctype" in raw[:200].lower():
-                text = _extract_main_text_from_html(raw)
-                if len(text) > 500:
-                    log_info(f"✅ URL fetch + HTML extraction: {len(raw)} → {len(text)} chars")
-                    return text
-                log_warn(f"⚠️ HTML extraction yielded only {len(text)} chars, falling back to raw text")
+            if "html" in content_type.lower() or "<html" in raw[:2000].lower() or "<!doctype" in raw[:200].lower():
+                text = ensure_non_empty_text("input-parse", _extract_main_text_from_html(raw), "HTML body")
+                log_info(f"✅ URL fetch + HTML extraction: {len(raw)} → {len(text)} chars")
+                return text
 
             ensure_non_empty_text("input-parse", raw, f"URL response from {url}")
             log_info(f"✅ URL fetch success: {len(raw)} chars")
@@ -174,7 +176,9 @@ def load_input(input_path):
     p = Path(input_path)
     if not p.exists():
         abort("input-parse", f"File not found: {input_path}")
-    if p.suffix.lower() == ".pdf":
+    with p.open("rb") as fh:
+        is_pdf = fh.read(5) == b"%PDF-"
+    if is_pdf or p.suffix.lower() == ".pdf":
         return extract_text_from_pdf(str(p))
     try:
         text = p.read_text(encoding="utf-8")

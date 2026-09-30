@@ -11,6 +11,8 @@ import base64
 import hashlib
 import json
 import os
+import io
+import wave
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ from .gemini import call_gemini_async, is_rate_limited_error
 from .prompts import (
     SPEAKER_NAMES,
     _build_tts_header,
+    _is_flash_tts_model,
     _tts_sample_context,
     speaker_name_for,
 )
@@ -36,21 +39,24 @@ def build_tts_text(entries, lang="zh", segment_position: str = "middle", tts_mod
     if not entries:
         return ""
 
-    lines = [_build_tts_header(segment_position)]
+    lines = [_build_tts_header(segment_position, tts_model)]
     for entry in entries:
         lines.append(f"{speaker_name_for(entry['speaker_id'])}: {entry['dialog']}")
     return "\n\n".join(lines)
 
 
-def build_single_turn_tts_text(entry, lang="zh", segment_position: str = "middle") -> str:
+def build_single_turn_tts_text(entry, lang="zh", segment_position: str = "middle", tts_model: str | None = None) -> str:
     """Build a single-speaker TTS prompt for one transcript turn."""
     segment_note = _tts_sample_context(segment_position)
+    if _is_flash_tts_model(tts_model):
+        segment_note = segment_note.replace("断奏式表达", "自然连贯的表达")
+    pace = "calm, deadpan, light, fluent; 吐字清楚、语流连贯，保持轻松自然的口语感；发音力度适中，按语意自然停顿，避免逐字强调或刻意拉开音节" if _is_flash_tts_model(tts_model) else "calm, deadpan, staccato, light, fluent, slightly fast"
     return f"""\
 TTS this single Chinese podcast line using the configured voice for {speaker_name_for(entry['speaker_id'])}.
 
 Delivery:
-- Standard mainland Mandarin; calm, deadpan, staccato, light, fluent, slightly fast.
-- No Taiwanese accent, Northeastern accent, heavy erhua, drama, heavy emphasis, over-articulation, or added words.
+- Standard mainland Mandarin; {pace}.
+- No Taiwanese accent, Northeastern accent, heavy erhua, {"excessive retroflex pronunciation, " if _is_flash_tts_model(tts_model) else ""}drama, heavy emphasis, over-articulation, or added words.
 - Read the line exactly. Do not add speaker labels, transitions, summaries, or extra words.
 - Segment note: {segment_note}
 
@@ -266,6 +272,14 @@ async def _write_tts_audio_files(
     audio_data = base64.b64decode(audio_b64)
     if not audio_data:
         raise RuntimeError("decoded audio payload is empty")
+    if audio_data.startswith(b"RIFF") and audio_data[8:12] == b"WAVE":
+        # Newer Gemini Flash TTS returns a WAV container with trailing metadata.
+        # Feeding the whole container to ffmpeg as raw PCM turns that metadata
+        # into a loud, repeated burst at the end of every turn.
+        with wave.open(io.BytesIO(audio_data), "rb") as wav:
+            if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, 24000):
+                raise RuntimeError("unsupported TTS WAV audio format")
+            audio_data = wav.readframes(wav.getnframes())
     Path(pcm_file).write_bytes(audio_data)
     await convert_pcm_to_mp3(pcm_file, mp3_tmp)
     ensure_file(mp3_tmp, "tts-audio-synthesis", f"{output_label} audio")
@@ -339,7 +353,7 @@ async def tts_render_async(
         entry = segment[0]
         speaker_id = entry["speaker_id"]
         voice_name = voice_a if speaker_id == 0 else voice_b
-        text = build_single_turn_tts_text(entry, lang, segment_position)
+        text = build_single_turn_tts_text(entry, lang, segment_position, tts_model)
         meta_extras = {"render_mode": "per-turn", "speaker_id": speaker_id, "voice_name": voice_name}
         start_detail = f"{len(text.encode('utf-8'))} bytes, {speaker_name_for(speaker_id)}, voice={voice_name}"
     else:
@@ -347,6 +361,27 @@ async def tts_render_async(
         text = build_tts_text(segment, lang, segment_position, tts_model)
         meta_extras = {}
         start_detail = f"{len(text.encode('utf-8'))} bytes, {len(segment)} turns"
+
+    body = _build_tts_body(text, mode=mode, voice_a=voice_a, voice_b=voice_b, voice_name=voice_name)
+    if tts_model in {"gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"}:
+        # 3.8 treats text as verbatim transcript; directions belong in metadata.
+        style = (
+            "使用自然的中国大陆标准普通话，平翘舌区分准确，翘舌音发音适度；吐字清楚、语流连贯，保持自然口语节奏。"
+            "整体冷静、克制、轻松，发音力度适中，按语意自然停顿，避免逐字强调或刻意拉开音节。"
+            "No heavy erhua or drama, "
+            "heavy emphasis or over-articulation. " + _tts_sample_context(segment_position).replace("断奏式表达", "自然连贯的表达")
+        )
+        parts = []
+        for turn in segment:
+            metadata = {"style": style}
+            if not is_per_turn:
+                metadata["speaker"] = speaker_name_for(turn["speaker_id"])
+            parts.append({"text": turn["dialog"], "speech_metadata": metadata})
+        body["contents"][0]["parts"] = parts
+        if is_per_turn:
+            body["generationConfig"]["speechConfig"] = {"voiceConfig": {"voice": voice_name}}
+        # Include both transcript and delivery metadata in cache identity.
+        text = json.dumps(parts, ensure_ascii=False, sort_keys=True)
 
     ensure_non_empty_text("tts-audio-synthesis", text, f"TTS {kind.lower()} {segment_idx + 1} prompt")
     expected_metadata = build_tts_segment_metadata(
@@ -371,7 +406,6 @@ async def tts_render_async(
 
     log_info(f"  🎙️ {label} start ({start_detail})")
 
-    body = _build_tts_body(text, mode=mode, voice_a=voice_a, voice_b=voice_b, voice_name=voice_name)
     output_label = f"{kind.lower()} {segment_idx + 1}"
     max_retries = 3
 

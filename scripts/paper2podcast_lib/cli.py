@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from urllib.parse import urlparse
 from .audio import concat_segments
 from .config import get_api_runtime, normalize_gemini_model
 from .input_parse import load_input
+from .provenance import review_receipt, review_matches
 from .prompts import _build_tts_header, speaker_name_for
 from .runtime import (
     LOGGER,
@@ -28,7 +30,13 @@ from .runtime import (
     record_degradation,
     reset_run_context,
 )
-from .script import generate_script, generate_script_multistage
+from .script import (
+    _NO_CONTEXT_BLOCK,
+    validate_review_route,
+    _review_transcript_with_external_model,
+    generate_script,
+    generate_script_multistage,
+)
 from .tts import (
     _entry_bytes,
     build_single_turn_tts_text,
@@ -47,7 +55,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--voice-a", default="Kore", help="Voice for speaker 0/Alice (default: Kore)")
     p.add_argument("--voice-b", default="Charon", help="Voice for speaker 1/Bob (default: Charon)")
     p.add_argument("--script-model", default="gemini-3.1-pro-preview", help="Model for script generation (default: gemini-3.1-pro-preview)")
-    p.add_argument("--tts-model", default="gemini-2.5-pro-preview-tts", help="TTS model (default: gemini-2.5-pro-preview-tts)")
+    p.add_argument("--tts-model", default="gemini-3.8-flash-tts", help="TTS model (default: gemini-3.8-flash-tts)")
     p.add_argument("--output", help="Output MP3 path")
     p.add_argument("--script-only", action="store_true", help="Only generate script")
     p.add_argument("--script", help="Use existing script JSON file")
@@ -67,6 +75,10 @@ def _build_argparser() -> argparse.ArgumentParser:
         dest="script_review",
         help="Skip external review/revision of generated scripts",
     )
+    p.add_argument("--review-api-key", default=None, help="Explicit review model API key; prefer --review-api-key-file for shells")
+    p.add_argument("--review-api-key-file", default=None, help="File containing the explicit review model API key")
+    p.add_argument("--review-base-url", default=None, help="Explicit OpenAI-compatible base URL for the review model")
+    p.add_argument("--review-source", default=None, help="File/URL the reviewer compares the script against (default: the positional input). Use with --script when the input is a URL whose page text is poor background")
     p.add_argument("--max-segment-bytes", type=int, default=2800, help="Max bytes per TTS segment (default: 2800)")
     p.add_argument("--workers", type=int, default=2, help="Parallel TTS workers")
     p.add_argument(
@@ -87,6 +99,13 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Directory for this run's temporary files (default: /tmp/paper2podcast_runs/<run_id>)",
     )
     p.add_argument("--skip-search", action="store_true", help="Skip background context search")
+    p.add_argument("--search-backend", choices=["tavily-agent", "gemini"], default="tavily-agent", help="Background research backend (default: tavily-agent)")
+    p.add_argument("--search-model", default=None, help="Independent research model (or SEARCH_MODEL); default gpt-6-astra with independent Codex")
+    p.add_argument("--search-provider", default=None, help="Independent research provider (or SEARCH_PROVIDER); never inherits the global model route")
+    p.add_argument("--search-model-api-key", default=None, help="Explicit search model API key; prefer --search-model-api-key-file for shells")
+    p.add_argument("--search-model-api-key-file", default=None, help="File containing the explicit search model API key")
+    p.add_argument("--search-model-base-url", default=None, help="Explicit OpenAI-compatible base URL for the search model")
+    p.add_argument("--search-use-hermes", action="store_true", help="Resolve the search model through Hermes instead of standalone config")
     p.add_argument("--no-multistage", action="store_false", dest="multistage", help="Disable multi-stage pipeline (Outline -> Write -> Review)")
     p.set_defaults(multistage=True, script_review=True)
     p.add_argument(
@@ -149,6 +168,10 @@ def _validate_cli_args(args) -> None:
         abort("config", "--review-provider must be non-empty when script review is enabled")
     if args.script_review and not str(args.review_model or "").strip():
         abort("config", "--review-model must be non-empty when script review is enabled")
+    if args.script_review:
+        validate_review_route(args.review_provider, args.review_model,
+                              args.review_api_key, args.review_api_key_file,
+                              args.review_base_url)
     if args.max_segment_bytes <= 0:
         abort("config", f"--max-segment-bytes must be > 0, got {args.max_segment_bytes}")
     if args.workers <= 0:
@@ -156,6 +179,43 @@ def _validate_cli_args(args) -> None:
     if args.turn_gap_ms < 0:
         abort("config", f"--turn-gap-ms must be >= 0, got {args.turn_gap_ms}")
 
+
+def _load_review_source(args) -> str:
+    """Load the background text used to judge a `--script` draft.
+
+    Prefers `--review-source` (e.g. the PDF-derived text or a local dump);
+    falls back to the positional input. URL inputs are re-fetched only when
+    no explicit source is given.
+    """
+    explicit = str(getattr(args, "review_source", "") or "").strip()
+    candidate = explicit or args.input
+    try:
+        paper_text = load_input(candidate)
+    except Exception as exc:
+        abort("script-review", f"Failed to load review source {candidate}: {type(exc).__name__}: {exc}", cause=exc)
+    paper_text = ensure_non_empty_text("script-review", paper_text, "review source text")
+    log_info(f"📚 Review source: {candidate} ({len(paper_text)} chars)")
+    return paper_text
+
+
+def _review_supplied_script(args, script: dict) -> None:
+    """Fail closed; reuse only an exact content/source/route-bound receipt."""
+    paper_text = _load_review_source(args)
+    base_url = args.review_base_url or os.getenv("REVIEW_MODEL_BASE_URL", "")
+    if review_matches(script.get("review"), script["podcast_transcripts"], paper_text,
+                      args.review_provider, args.review_model, base_url):
+        log_info("✅ Script review reused: content, source and reviewer match")
+        return
+    begin_stage("script-review", "reviewing supplied script")
+    script["podcast_transcripts"] = _review_transcript_with_external_model(
+        paper_text=paper_text, context_block=_NO_CONTEXT_BLOCK,
+        entries=script["podcast_transcripts"],
+        review_provider=args.review_provider, review_model=args.review_model,
+        review_enabled=True, review_api_key=args.review_api_key,
+        review_api_key_file=args.review_api_key_file, review_base_url=args.review_base_url,
+    )
+    script["review"] = review_receipt(script["podcast_transcripts"], paper_text,
+                                      args.review_provider, args.review_model, base_url)
 
 def _load_or_generate_script(args, api_runtime, script_path: str):
     """Either load an existing script JSON, or run the generation pipeline."""
@@ -166,12 +226,22 @@ def _load_or_generate_script(args, api_runtime, script_path: str):
             script = json.loads(Path(args.script).read_text(encoding="utf-8"))
         except Exception as exc:
             abort("input-parse", f"Failed to load script file {args.script}: {type(exc).__name__}: {exc}", cause=exc)
+        if isinstance(script, list):
+            script = {"podcast_transcripts": script}
         if not isinstance(script, dict):
             abort("input-parse", f"Script file did not contain a JSON object: {args.script}")
         script["podcast_transcripts"] = validate_transcript_entries(
             script.get("podcast_transcripts", []),
             "input-parse existing script",
         )
+        # An externally supplied script still gets reviewed when review is on:
+        # `--script` exists to bypass brittle *generation*, not to skip the
+        # non-Gemini quality gate. Background comes from --review-source/input.
+        if args.script_review and args.review_provider.strip():
+            _review_supplied_script(args, script)
+        else:
+            script["review"] = {"status": "skipped", "reviewed": False,
+                                "reason": "explicit --no-script-review"}
         return script
 
     paper_text = load_input(args.input)
@@ -189,11 +259,24 @@ def _load_or_generate_script(args, api_runtime, script_path: str):
         review_provider=args.review_provider,
         review_model=args.review_model,
         review_enabled=args.script_review,
+        review_api_key=args.review_api_key,
+        review_api_key_file=args.review_api_key_file,
+        review_base_url=args.review_base_url,
+        search_backend=args.search_backend,
+        search_model=args.search_model,
+        search_provider=args.search_provider,
+        search_model_api_key=args.search_model_api_key,
+        search_model_api_key_file=args.search_model_api_key_file,
+        search_model_base_url=args.search_model_base_url,
+        search_use_hermes=args.search_use_hermes,
     )
 
-    begin_stage("file-write", "writing generated script JSON")
-    script_path = write_json_file(script_path, script, "file-write", "script JSON")
-    get_run_context().script_path = script_path
+    script["review"] = (
+        review_receipt(script["podcast_transcripts"], paper_text, args.review_provider,
+                       args.review_model, args.review_base_url or os.getenv("REVIEW_MODEL_BASE_URL", ""))
+        if args.script_review else {"status": "skipped", "reviewed": False,
+                                   "reason": "explicit --no-script-review"}
+    )
     return script
 
 
@@ -286,20 +369,30 @@ def main() -> int:
         _validate_cli_args(args)
         args.script_model = normalize_gemini_model(args.script_model)
         args.tts_model = normalize_gemini_model(args.tts_model)
+        if args.tts_model == "gemini-3.1-flash-tts-preview":
+            args.tts_model = "gemini-3.8-flash-tts"
+            log_info("🔁 Using gemini-3.8-flash-tts for legacy Flash TTS selection")
 
         needs_api = not (args.script and args.script_only)
         api_runtime = get_api_runtime(args) if needs_api else None
 
         output_path = _resolve_output_path(args, work_dir)
-        script_path = output_path.rsplit(".", 1)[0] + "_script.json"
+        script_path = str(work_dir / "final_script.json")
+        if args.script and Path(args.script).resolve() == Path(script_path).resolve():
+            import uuid
+            script_path = str(work_dir / f"final_script_{uuid.uuid4().hex}.json")
         get_run_context().output_path = output_path
         get_run_context().script_path = script_path
 
         begin_stage("input-parse", f"source={args.input}")
         script = _load_or_generate_script(args, api_runtime, script_path)
 
+        # One atomic checkpoint for every path, before any TTS request.
+        begin_stage("file-write", "persisting exact final transcript before TTS")
+        written = write_json_file(script_path, script, "file-write", "final script JSON")
+        get_run_context().script_path = written
         if args.script_only:
-            log_info("📝 Script-only mode, done.")
+            log_info(f"📝 Script-only mode, done: {written}")
             return exit_code
 
         entries = validate_transcript_entries(script.get("podcast_transcripts", []), "tts-audio-synthesis")

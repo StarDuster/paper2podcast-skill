@@ -177,15 +177,14 @@ SCRIPT_REVIEW_PROMPT_ZH = """\
    “震撼”“寒意”“绝对”“彻底”“极其”“疯狂”“背后发凉”“致命”“军备竞赛”
    “临界点”“终极命题”“无可估量”“质的飞跃”“范式级突破”“唯一可行路径”等。
    不是简单删词，而是改成有证据支撑、克制、自然的技术陈述。
-2. 修正不严谨的内容。凡是原文或背景没有支撑的日期、版本号、机构动作、实验结论、
-   因果判断、未来预测和安全事件，都要删掉或改成不确定表述。
-3. 保留技术密度，但避免用宏大判断替代论证。需要把“必然、完全、根本、无法、唯一”
+2. 保留技术密度，但避免用宏大判断替代论证。需要把“必然、完全、根本、无法、唯一”
    这类绝对化结论改成条件明确的说法。
-4. 保留双人讨论结构和中文口语感，但不要油滑、不要网络黑话、不要互相吹捧。
+3. 保留双人讨论结构和中文口语感，但不要油滑、不要网络黑话、不要互相吹捧。
+4. 审阅中的纠错与证据核对只在内部完成；最终 dialog 直接讲清核实后的状态、条件和证据范围。不要把被排除的说法带进节目作对照，也不要为了显得严谨反复说“不能把 X 说成 Y”“不是 X 而是 Y”。遇到缺少关键来源的技术主张，标记为待补证，不要在台词里说“文中提到 X，但我们没有参考那篇来源”；有可核实资料时补足证据后直接讲结论，仍无证据时省去该主张或明确说已知范围。
 5. style 字段可以保留、删除或改写；如果保留，只允许平稳、克制、轻微的语气描述。
 
 ## 硬性限制
-- 不要新增原文和背景信息以外的事实。
+- 可以补充原文与背景信息以外的相关事实，但须先通过可用的检索工具取得可靠来源并核实；没有检索工具时标记待核实，不要凭空新增。
 - 不要改变 JSON 顶层结构，仍然只输出 `podcast_transcripts`。
 - 每个条目必须保留 `speaker_id` 和 `dialog`。
 - 尽量保留原有轮数、顺序和主要技术点；只有发现重复、注水或明显不严谨时才合并或删减。
@@ -263,9 +262,10 @@ def _tts_sample_context(segment_position: str) -> str:
     return _TTS_SAMPLE_CONTEXT_ZH.get(segment_position, _TTS_SAMPLE_CONTEXT_ZH["middle"])
 
 
-def _build_tts_header(segment_position: str = "middle") -> str:
+def _build_tts_header(segment_position: str = "middle", tts_model: str | None = None) -> str:
     """Compact TTS prompt header that keeps speaker labels unambiguous."""
     segment_note = _tts_sample_context(segment_position)
+    pace = "calm, deadpan, staccato, light, fluent" if _is_flash_tts_model(tts_model) else "calm, deadpan, staccato, light, fluent, slightly fast"
     return f"""\
 TTS the following conversation between Alice and Bob.
 
@@ -275,8 +275,8 @@ Voice binding:
 - Do not swap voices or infer voices from content. Do not speak speaker labels.
 
 Delivery:
-- Standard mainland Mandarin; calm, deadpan, staccato, light, fluent, slightly fast.
-- No Taiwanese accent, Northeastern accent, heavy erhua, drama, heavy emphasis, over-articulation, or added words.
+- Standard mainland Mandarin; {pace}.
+- No Taiwanese accent, Northeastern accent, heavy erhua, {"excessive retroflex pronunciation, " if _is_flash_tts_model(tts_model) else ""}drama, heavy emphasis, over-articulation, or added words.
 - Read every line exactly in order. Do not skip, rewrite, merge, summarize, or add transitions.
 - Segment note: {segment_note}
 

@@ -34,3 +34,15 @@ env/
 *.pcm
 *.log
 paper2podcast_runs/
+*.wav
+*.m4a
+*.pdf
+.pytest_cache/
+.cache/
+logs/
+secrets/
+*.events.jsonl
+# Private run/session records are not public documentation.
+references/session-*
+references/case-study-*
+docs/*test-log*

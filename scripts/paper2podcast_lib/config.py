@@ -117,6 +117,11 @@ def get_api_runtime(args) -> ApiRuntime:
         abort("config", f"Failed to resolve Vertex runtime: {type(exc).__name__}: {exc}", cause=exc)
 
     base_url = str(runtime.get("base_url") or "").rstrip("/")
+    # Hermes returns the OpenAI-compatible endpoint (…/endpoints/openapi), but this
+    # pipeline calls native generateContent. Rewrite to the native publishers path so
+    # gemini.py's `{base_url}/models/{model}:generateContent` resolves correctly.
+    if base_url.endswith("/endpoints/openapi"):
+        base_url = base_url[: -len("/endpoints/openapi")] + "/publishers/google"
     credentials_file = str(getattr(args, "vertex_credentials_file", "") or runtime.get("credentials_file") or "")
     if not base_url:
         abort("config", "Vertex runtime did not return a base_url")
